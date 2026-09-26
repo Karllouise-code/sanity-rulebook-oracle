@@ -1,5 +1,6 @@
 import { generateText } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
+import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createMCPClient, type MCPClient } from '@ai-sdk/mcp';
 
 /**
@@ -28,7 +29,8 @@ function readEnv(key: string): string | undefined {
  *      entry, and flags errata entries whose changeType is 'override'.
  *
  * Two answer modes:
- *   - 'llm'        when OPENAI_API_KEY is set  (generateText summarizes).
+ *   - 'llm'        when GOOGLE_GENERATIVE_AI_API_KEY or OPENAI_API_KEY is
+ *                  set (generateText summarizes; Gemini takes precedence).
  *   - 'retrieval'  otherwise                     (deterministic compose).
  *   - 'mock'       when RULEBOOK_MOCK=1          (offline UI demo, no Sanity).
  */
@@ -142,7 +144,7 @@ export async function describeTools(): Promise<{
 //   - `knowledge_base_read`  -> `{ knowledgeBase, paths: string[] }` returning
 //                               the full markdown content of those entries.
 // There is no free-text search: to answer, we map the user's question onto
-// outline paths with a lightweight keyword scorer. When OPENAI_API_KEY is set
+// outline paths with a lightweight keyword scorer. When an LLM key
 // the LLM then composes the final answer from exactly the entries read.
 
 const KB_ID_RE = /^Knowledge base id:\s*`?([A-Za-z0-9_-]+)`?/m;
@@ -461,11 +463,27 @@ function formatForLlm(question: string, initialContext: string, entries: Retriev
   };
 }
 
+function getLlmConfig(): { provider: 'google' | 'openai'; modelName: string } | null {
+  if (readEnv('GOOGLE_GENERATIVE_AI_API_KEY')) {
+    return { provider: 'google', modelName: readEnv('GEMINI_MODEL') || 'gemini-3.8-flash' };
+  }
+  if (readEnv('OPENAI_API_KEY')) {
+    return { provider: 'openai', modelName: readEnv('OPENAI_MODEL') || 'gpt-4o-mini' };
+  }
+  return null;
+}
+
 async function composeLlmAnswer(question: string, initialContext: string, entries: RetrievedEntry[]): Promise<string> {
-  const modelName = readEnv('OPENAI_MODEL') || 'gpt-4o-mini';
-  const openai = createOpenAI({ apiKey: readEnv('OPENAI_API_KEY') ?? '' });
+  const config = getLlmConfig();
+  if (!config) throw new Error('No LLM provider configured');
   const { system, prompt } = formatForLlm(question, initialContext, entries);
-  const result = await generateText({ model: openai(modelName), system, prompt, temperature: 0.2 });
+  if (config.provider === 'google') {
+    const google = createGoogleGenerativeAI({ apiKey: readEnv('GOOGLE_GENERATIVE_AI_API_KEY') ?? '' });
+    const result = await generateText({ model: google(config.modelName), system, prompt, temperature: 0.2 });
+    return result.text;
+  }
+  const openai = createOpenAI({ apiKey: readEnv('OPENAI_API_KEY') ?? '' });
+  const result = await generateText({ model: openai(config.modelName), system, prompt, temperature: 0.2 });
   return result.text;
 }
 
@@ -541,11 +559,11 @@ export async function answerQuestion(question: string): Promise<AgentResult> {
     };
   }
 
-  const llmEnabled = Boolean(readEnv('OPENAI_API_KEY'));
-  if (llmEnabled) {
+  const llmConfig = getLlmConfig();
+  if (llmConfig) {
     const initialContext = await getInitialContext();
     const answer = await composeLlmAnswer(question, initialContext, entries);
-    return { answer, citations, hasOverride, mode: 'llm', tools, modelUsed: readEnv('OPENAI_MODEL') || 'gpt-4o-mini' };
+    return { answer, citations, hasOverride, mode: 'llm', tools, modelUsed: llmConfig.modelName };
   }
 
   return {
@@ -567,7 +585,7 @@ export function getStatus(): {
   return {
     urlConfigured: Boolean(readEnv('SANITY_CONTEXT_MCP_URL')),
     tokenConfigured: Boolean(readEnv('SANITY_ORGANIZATION_TOKEN')),
-    llmConfigured: Boolean(readEnv('OPENAI_API_KEY')),
+    llmConfigured: getLlmConfig() !== null,
     mock: readEnv('RULEBOOK_MOCK') === '1',
   };
 }

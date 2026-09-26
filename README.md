@@ -105,6 +105,9 @@ SANITY_ORGANIZATION_TOKEN=sk_<token with Context Viewer>
 # Optional — lets the LLM summarize retrieved entries instead of the
 # deterministic composer. Either way answers are built ONLY from the
 # retrieved entries and citations are always returned.
+# Gemini (free tier) takes precedence when set; otherwise OpenAI is used.
+GOOGLE_GENERATIVE_AI_API_KEY=
+GEMINI_MODEL=gemini-3.8-flash
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o-mini
 
@@ -138,10 +141,10 @@ npm run dev            # http://localhost:4321
 
 1. Creates the MCP client via `createMCPClient({ transport: { type: 'http', url, headers } })` with a `Bearer` org token — this is **Knowledge Base mode**, not raw GROQ.
 2. Pulls `client.tools()` and asserts `initial_context` + `knowledge_base_read` exist.
-3. Feeds each user question into `knowledge_base_read` (arguments built from the tool's own input schema).
-4. Normalizes whatever the tool returns (structured entries or Markdown JSON) into uniform `{title, kind, changeType, sourceUrl, content}` entries.
+3. Feeds each user question into `knowledge_base_read` (paths picked by keyword-scoring the `initial_context` outline).
+4. Parses the returned Markdown entries into uniform `{title, kind, changeType, content, sources}` entries.
 5. Composes an answer that uses **only** those entries:
-   - **LLM mode** (`OPENAI_API_KEY` set): `generateText` with a system prompt that forces inline citations and explicit override-vs-rulebook statements; the endpoint's `initial_context` is injected too.
+   - **LLM mode** (Gemini or OpenAI key set): `generateText` with a system prompt that forces inline citations and explicit override-vs-rulebook statements; the endpoint's `initial_context` is injected too. Gemini takes precedence when `GOOGLE_GENERATIVE_AI_API_KEY` is set.
    - **Retrieval mode**: deterministic composer that lists each retrieved entry with its source.
    - **Mock mode** (`RULEBOOK_MOCK=1`): canned entries for an offline UI demo.
 6. Returns structured `citations` (`changeType`, `sourceUrl`, `override` flag) so the UI renders **Override / Clarify** badges.
