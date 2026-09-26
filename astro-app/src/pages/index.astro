@@ -1,0 +1,220 @@
+---
+/**
+ * Rulebook Oracle — single-page chat UI.
+ * Talks to the server-side agent loop at /api/chat.
+ */
+const exampleQuestions = [
+  'Can I attack twice if I wield two short swords?',
+  'What happens when my Health hits 0?',
+  'Does advantage from high ground stack with advantage from a spell?',
+  'Is a natural 6 always a hit?',
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rulebook Oracle</title>
+    <meta
+      name="description"
+      content="Ask the Steeldusk rules agent anything. Answers cite the core rulebook, errata, and FAQs, and flag overrides."
+    />
+    <link rel="stylesheet" href="/src/styles/global.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="wordmark">
+        <h1>Rulebook Oracle</h1>
+        <p class="tagline">Ask anything about the Steeldusk rules. Every answer cites its sources.</p>
+      </header>
+
+      <section class="chat" aria-label="Chat">
+        <div id="messages" class="messages"></div>
+
+        <form id="chat-form" class="composer" autocomplete="off">
+          <input
+            id="question"
+            name="question"
+            type="text"
+            maxlength="500"
+            placeholder="e.g. Can I attack twice if I wield two short swords?"
+            required
+          />
+          <button id="send" type="submit">Ask</button>
+        </form>
+
+        <div class="examples" aria-label="Example questions">
+          {exampleQuestions.map((q) => <button type="button" class="chip" data-example={q}>{q}</button>)}
+        </div>
+      </section>
+
+      <footer class="status">
+        <span id="status-label">checking connection…</span>
+      </footer>
+    </main>
+
+    <script>
+      interface Citation {
+        kind: string;
+        title: string;
+        sourceUrl?: string;
+        changeType?: string;
+        override?: boolean;
+      }
+
+      interface ChatData {
+        ok?: boolean;
+        error?: string;
+        answer?: string;
+        citations?: Citation[];
+        hasOverride?: boolean;
+        mode?: string;
+        tools?: string[];
+        mock?: boolean;
+      }
+
+      // ---- tiny escape helper so retrieved text cannot inject HTML ----
+      function esc(value: unknown) {
+        return String(value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;');
+      }
+
+      const messagesEl = document.getElementById('messages') as HTMLElement;
+      const form = document.getElementById('chat-form') as HTMLFormElement;
+      const input = document.getElementById('question') as HTMLInputElement;
+      const sendBtn = document.getElementById('send') as HTMLButtonElement;
+      const statusLabel = document.getElementById('status-label') as HTMLElement;
+
+      async function ask(question: string) {
+        renderUser(question);
+        setBusy(true);
+        const bubble = renderLoading();
+
+        try {
+          const res = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ question }),
+          });
+          const data = (await res.json()) as ChatData;
+
+          if (!res.ok || !data.ok) {
+            throw new Error(data.error || `Request failed (${res.status})`);
+          }
+
+          renderAnswer(bubble, data);
+          statusLabel.textContent = `${data.mode} mode · ${data.citations?.length ?? 0} source(s)`;
+        } catch (error) {
+          bubble.parentNode ? bubble.parentNode.removeChild(bubble) : undefined;
+          renderError(error instanceof Error ? error.message : String(error));
+          statusLabel.textContent = 'error';
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      function renderUser(question: string) {
+        const row = document.createElement('div');
+        row.className = 'message user';
+        row.innerHTML = `<b>You</b><p>${esc(question)}</p>`;
+        messagesEl.appendChild(row);
+        scrollBottom();
+      }
+
+      function renderLoading() {
+        const row = document.createElement('div');
+        row.className = 'message agent';
+        row.innerHTML = `<b>Oracle</b><p class="typing">Consulting the rulebook…</p>`;
+        messagesEl.appendChild(row);
+        scrollBottom();
+        return row;
+      }
+
+      function renderAnswer(bubble: HTMLElement, data: ChatData) {
+        const hasOverride = data.hasOverride;
+        bubble.className = 'message agent' + (hasOverride ? ' has-override' : '');
+        const badge = hasOverride
+          ? `<span class="badge override" title="A newer errata entry replaces the core rulebook for this question">Override</span>`
+          : '';
+        const tain = `<b>Oracle</b> ${badge}`;
+        const body = `<p class="answer">${esc(data.answer ?? '')
+          .replaceAll('\n', '<br>')}</p>`;
+
+        const cite = data.citations && data.citations.length
+          ? `<details class="sources" open>
+               <summary>Sources (${data.citations.length})</summary>
+               <ul>${data.citations
+                 .map((c) => {
+                   const kind = c.kind === 'errataItem' ? 'Errata' : c.kind === 'faqItem' ? 'FAQ' : 'Rule';
+                   const flag = c.override
+                     ? '<span class="badge small">Override</span>'
+                     : c.changeType === 'clarify'
+                     ? '<span class="badge small">Clarify</span>'
+                     : '';
+                   const url = c.sourceUrl ? ` · <a href="${esc(c.sourceUrl)}" target="_blank" rel="noopener">source</a>` : '';
+                   return `<li><span class="kind">${kind}</span> ${esc(c.title)}${flag}${url}</li>`;
+                 })
+                 .join('')}</ul>
+             </details>`
+          : '';
+
+        bubble.innerHTML = tain + body + cite;
+        scrollBottom();
+      }
+
+      function renderError(message: string) {
+        const row = document.createElement('div');
+        row.className = 'message error';
+        row.innerHTML = `<b>Oracle</b><p>${esc(message)}</p>`;
+        messagesEl.appendChild(row);
+        scrollBottom();
+      }
+
+      function setBusy(busy: boolean) {
+        sendBtn.disabled = busy;
+        input.disabled = busy;
+        sendBtn.textContent = busy ? '…' : 'Ask';
+      }
+
+      function scrollBottom() {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const question = input.value.trim();
+        if (!question) return;
+        input.value = '';
+        ask(question);
+      });
+
+      document.querySelectorAll<HTMLButtonElement>('.chip').forEach((chip) => {
+        chip.addEventListener('click', () => ask(chip.dataset.example ?? ''));
+      });
+
+      input.focus();
+
+      fetch('/api/chat', { method: 'GET' })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.ok) {
+            const tools = data.tools || [];
+            statusLabel.textContent = `knowledge base mode · connected · tools: ${tools.join(', ')}`;
+          } else if (data.mock) {
+            statusLabel.textContent = 'mock mode · connected (offline demo, no Sanity)';
+          } else {
+            statusLabel.textContent = `not connected · ${data.error}`;
+          }
+        })
+        .catch(() => {
+          statusLabel.textContent = 'not connected · server unreachable';
+        });
+    </script>
+  </body>
+</html>

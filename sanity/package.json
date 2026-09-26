@@ -1,0 +1,25 @@
+{
+  "name": "rulebook-oracle-sanity",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.19 <22 || >=22.12"
+  },
+  "scripts": {
+    "dev": "sanity dev",
+    "build": "sanity build",
+    "deploy": "sanity deploy",
+    "schema": "sanity schema deploy",
+    "seed": "node seed/seed.js",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sanity/client": "^6.29.1",
+    "sanity": "^5.31.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^5.8.3"
+  }
+}

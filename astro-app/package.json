@@ -1,0 +1,28 @@
+{
+  "name": "rulebook-oracle-astro",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@ai-sdk/mcp": "^1.0.82",
+    "@ai-sdk/openai": "^2.0.127",
+    "@astrojs/node": "^9.5.5",
+    "ai": "^5.0.261",
+    "astro": "^5.18.2"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.6",
+    "@types/node": "^26.6.2",
+    "typescript": "^5.8.3"
+  }
+}
