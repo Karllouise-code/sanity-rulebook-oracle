@@ -3,6 +3,19 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createMCPClient, type MCPClient } from '@ai-sdk/mcp';
 
 /**
+ * Read a config value from whichever runtime is present.
+ * - Astro/Vite populates `import.meta.env` from `astro-app/.env`.
+ * - Node-only hosts (Vercel/Netlify/standalone) set real `process.env`.
+ * Prefer `import.meta.env` for local `.env` support, fall back to
+ * `process.env` for OS/cloud-injected variables.
+ */
+function readEnv(key: string): string | undefined {
+  const metaEnv = (import.meta as unknown as { env?: Record<string, unknown> }).env;
+  const fromMeta = metaEnv && typeof metaEnv[key] === 'string' ? (metaEnv[key] as string) : undefined;
+  return fromMeta || process.env[key] || undefined;
+}
+
+/**
  * Agent loop for the Rulebook Oracle.
  *
  * Flow (matches the Sanity Challenge Path One requirements):
@@ -22,6 +35,12 @@ import { createMCPClient, type MCPClient } from '@ai-sdk/mcp';
 
 export type CitationKind = 'ruleSection' | 'errataItem' | 'faqItem';
 
+export interface KbSource {
+  title: string;
+  kind: CitationKind;
+  override: boolean;
+}
+
 export interface RetrievedEntry {
   id: string;
   kind: CitationKind;
@@ -31,6 +50,7 @@ export interface RetrievedEntry {
   effectiveDate?: string;
   sourceUrl?: string;
   content: string;
+  sources?: KbSource[];
 }
 
 export interface Citation extends RetrievedEntry {
@@ -67,8 +87,8 @@ let clientPromise: Promise<MCPClient> | null = null;
 function getClient(): Promise<MCPClient> {
   if (clientPromise) return clientPromise;
 
-  const url = process.env.SANITY_CONTEXT_MCP_URL;
-  const token = process.env.SANITY_ORGANIZATION_TOKEN;
+  const url = readEnv('SANITY_CONTEXT_MCP_URL');
+  const token = readEnv('SANITY_ORGANIZATION_TOKEN');
 
   if (!url || !token) {
     throw new Error(
@@ -112,24 +132,109 @@ export async function describeTools(): Promise<{
   };
 }
 
-/**
- * Build the arguments for the MCP tool from its input schema. Prefers a
- * query-ish property; caps result-count properties at 6. Falls back to a
- * plain `{ query }` when the schema doesn't advertise any properties.
- */
-function buildQueryArgs(tool: CallableTool | undefined, text: string): Record<string, unknown> {
-  const properties = (tool?.inputSchema?.properties as Record<string, unknown>) ?? {};
-  const keys = Object.keys(properties);
+// ---------------------------------------------------------------------------
+// Knowledge Base outline + path selection
+// ---------------------------------------------------------------------------
+//
+// The Context MCP endpoint in Knowledge Base mode exposes two tools:
+//   - `initial_context`      -> a markdown outline with the knowledge base id
+//                               and every entry's `path`.
+//   - `knowledge_base_read`  -> `{ knowledgeBase, paths: string[] }` returning
+//                               the full markdown content of those entries.
+// There is no free-text search: to answer, we map the user's question onto
+// outline paths with a lightweight keyword scorer. When OPENAI_API_KEY is set
+// the LLM then composes the final answer from exactly the entries read.
 
-  if (keys.length === 0) return { query: text };
+const KB_ID_RE = /^Knowledge base id:\s*`?([A-Za-z0-9_-]+)`?/m;
+const MAX_PATHS_READ = 4;
 
-  const args: Record<string, unknown> = {};
-  for (const key of keys) {
-    if (/query|question|prompt|search|text/i.test(key)) args[key] = text;
-    else if (/(limit|top|maxresults|count|k)\b/i.test(key) || key === 'k' || key === 'topK') args[key] = 6;
+const OUTLINE_STOPWORDS = new Set([
+  'a', 'an', 'the', 'this', 'that', 'these', 'those', 'and', 'or', 'but', 'of', 'to',
+  'for', 'on', 'in', 'at', 'by', 'with', 'without', 'from', 'as', 'is', 'are', 'was',
+  'were', 'be', 'been', 'being', 'do', 'does', 'did', 'can', 'could', 'would',
+  'should', 'may', 'might', 'will', 'shall', 'i', 'you', 'me', 'my', 'your', 'yours',
+  'we', 'us', 'our', 'they', 'them', 'he', 'him', 'his', 'she', 'her', 'it', 'its',
+  'what', 'when', 'where', 'who', 'whom', 'which', 'why', 'how', 'if', 'then',
+  'than', 'so', 'too', 'very', 'just', 'not', 'no', 'yes', 'want', 'need', 'does',
+  'up', 'down', 'out', 'off', 'over', 'under', 'more', 'much', 'many', 'any', 'all',
+  'every', 'each', 'both', 'either', 'neither', 'same', 'always', 'never', 'get',
+  'gets', 'make', 'makes',
+]);
+
+const OUTLINE_SYNONYMS: Record<string, string> = {
+  swords: 'weapon', sword: 'weapon', blades: 'weapon', blade: 'weapon',
+  daggers: 'weapon', dagger: 'weapon', axes: 'weapon', axe: 'weapon',
+  strikes: 'attack', strike: 'attack', swing: 'attack',
+  twice: 'two',
+  disadvantage: 'advantage', stack: 'advantage', stacking: 'advantage',
+  hp: 'health', stamina: 'health', wounds: 'health', wound: 'health',
+  injuries: 'health', injury: 'health', healing: 'health',
+  dying: 'death', deaths: 'death', death: 'death', dead: 'death',
+  unconscious: 'death', stabilize: 'death', stabilizes: 'death', stabilized: 'death',
+  magic: 'spell', spells: 'spell', cast: 'spell', casting: 'spell',
+  dice: 'roll', d6: 'roll', d6s: 'roll', rolls: 'roll', roll: 'roll',
+  critical: 'roll', crit: 'roll', successes: 'roll', success: 'roll',
+  turns: 'turn', actions: 'action', move: 'action',
+  rests: 'rest', resting: 'rest',
+};
+
+interface OutlineEntry {
+  path: string;
+  description: string;
+  topics: string[];
+}
+
+function outlineTokens(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .map((w) => OUTLINE_SYNONYMS[w] ?? w)
+      .filter((w) => w.length > 1 && !OUTLINE_STOPWORDS.has(w))
+  );
+}
+
+function parseOutline(text: string): { kbId: string; entries: OutlineEntry[] } {
+  const kb = text.match(KB_ID_RE);
+  const entries: OutlineEntry[] = [];
+  let current: OutlineEntry | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (!line || line.startsWith('#') || line.startsWith(' ')) {
+      if (line && current) {
+        const topics = line.match(/^\s*topics:\s*(.+)$/i);
+        if (topics) current.topics = topics[1].split(',').map((t) => t.trim());
+        else if (!/^\s*(excludes|related):/i.test(line)) {
+          current.description += ` ${line.trim()}`;
+        }
+      }
+      continue;
+    }
+    const pathMatch = line.match(/^([a-z0-9_.-]+)(?:\/[a-z0-9_.-]+)*(?:\s+\[core\])?$/i);
+    if (pathMatch) {
+      current = { path: pathMatch[0].replace(/\s+\[core\]$/i, ''), description: '', topics: [] };
+      entries.push(current);
+    }
   }
-  if (Object.keys(args).length === 0) args[keys[0]] = text;
-  return args;
+  return { kbId: kb?.[1] ?? '', entries };
+}
+
+function selectPaths(question: string, entries: OutlineEntry[]): OutlineEntry[] {
+  const q = outlineTokens(question);
+  if (q.size === 0) return entries.slice(0, 1);
+  const scored = entries.map((entry) => {
+    const hay = outlineTokens(
+      `${entry.path.replace(/[/_-]/g, ' ')} ${entry.description} ${entry.topics.join(' ')}`
+    );
+    let score = 0;
+    for (const tok of q) {
+      if (entry.path.toLowerCase().includes(tok)) score += 3;
+      if (hay.has(tok)) score += 1;
+    }
+    return { entry, score };
+  });
+  const best = scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score);
+  return best.slice(0, MAX_PATHS_READ).map((s) => s.entry);
 }
 
 /** Extract the human-readable text from an MCP CallToolResult of any shape. */
@@ -154,112 +259,65 @@ function extractResultText(result: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Retrieval normalization
+// Knowledge base entry parsing (markdown returned by knowledge_base_read)
 // ---------------------------------------------------------------------------
 
-function asArray(value: unknown, keys: string[]): unknown[] | null {
-  if (Array.isArray(value)) return value;
-  const obj = value as Record<string, unknown> | null;
-  if (!obj) return null;
-  for (const key of keys) {
-    const v = obj[key];
-    if (Array.isArray(v) && v.length > 0) return v;
+const OVERRIDE_TAG_RE = /\[OVERRIDE\]/i;
+
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function parseKbEntryMarkdown(blob: string): RetrievedEntry[] {
+  const entries: RetrievedEntry[] = [];
+  for (const section of blob.split(/\n(?=# )/)) {
+    const entry = parseKbEntrySection(section);
+    if (entry) entries.push(entry);
   }
-  return null;
+  return entries;
 }
 
-function pick(obj: unknown, keys: string[]): unknown {
-  const o = obj as Record<string, unknown> | null;
-  if (!o) return undefined;
-  for (const key of keys) {
-    if (o[key] !== undefined && o[key] !== null && o[key] !== '') return o[key];
+function parseKbEntrySection(section: string): RetrievedEntry | null {
+  const titleLine = section.match(/^#\s+(.+?)\s*$/m);
+  if (!titleLine) return null;
+  const title = titleLine[1].trim();
+
+  let body = section.trim().replace(/^#\s+(.+?)\s*$/m, '').trim();
+  const sources: KbSource[] = [];
+
+  const sourcesMatch = body.match(/##\s+Sources\s*\r?\n([\s\S]*)$/);
+  if (sourcesMatch) {
+    body = body.replace(sourcesMatch[0], '').trim();
+    for (const line of sourcesMatch[1].split(/\r?\n/)) {
+      const parts = line.match(/^\d+\.\s+(.+?)\s+—\s+(.+)$/);
+      if (!parts) continue;
+      const sourceTitle = parts[1].trim();
+      const isOverride = OVERRIDE_TAG_RE.test(sourceTitle);
+      const clean = sourceTitle.replace(/^\[(?:OVERRIDE|CLARIFY)\]\s*/, '');
+      const lower = clean.toLowerCase();
+      const kind: CitationKind = /errata|original|superseded|override|clarif/i.test(clean)
+        ? 'errataItem'
+        : /^(faq|faqitem)|question/i.test(lower)
+        ? 'faqItem'
+        : 'ruleSection';
+      sources.push({ title: clean, kind, override: isOverride });
+    }
   }
-  return undefined;
-}
 
-function firstString(obj: unknown, keys: string[]): string {
-  const value = pick(obj, keys);
-  return typeof value === 'string' ? value : value instanceof Object ? JSON.stringify(value) : '';
-}
-
-function parseStructuredCandidates(rawText: string, rawResult: unknown): unknown[] | null {
-  const r = rawResult as Record<string, unknown> | null;
-  const container = r?.structuredContent ?? r?.toolResult;
-  const fromContainer = asArray(container, ['entries', 'results', 'items', 'sources', 'data']);
-  if (fromContainer) return fromContainer;
-
-  try {
-    const parsed = JSON.parse(rawText) as unknown;
-    return asArray(parsed, ['entries', 'results', 'items', 'sources', 'data']);
-  } catch {
-    return null;
-  }
-}
-
-function normalizeChangeType(entry: unknown, kind: CitationKind, title: string, content: string): 'clarify' | 'override' | undefined {
-  const value = pick(entry, ['changeType', 'change_type']);
-  if (value === 'override' || value === 'clarify') return value;
-  if (kind !== 'errataItem') return undefined;
-  if (OVERRIDE_RE.test(title) || OVERRIDE_RE.test(content)) return 'override';
-  if (/\bclarif/i.test(title) || /\bclarification/i.test(content)) return 'clarify';
-  return undefined;
-}
-
-function toEntry(item: unknown): RetrievedEntry | null {
-  if (typeof item === 'string') {
-    return { id: 'retrieved-context', kind: 'ruleSection', title: 'Retrieved context', content: item };
-  }
-  if (!item || typeof item !== 'object') return null;
-
-  const obj = item as Record<string, unknown>;
-  const content = firstString(obj, ['content', 'body', 'text', 'summary', 'answer']);
-  const title = firstString(obj, ['title', 'name', 'question']).replace(/^\[(?:OVERRIDE|CLARIFY)\]\s*/, '');
-  if (!content) return null;
-
-  const typeStr = firstString(obj, ['_type', 'type', 'sourceType', 'documentType']);
-  const isErrata = /errata/i.test(typeStr) || obj.changeType !== undefined || /override|clarif/i.test(title);
-  const isFaq = /faq/i.test(typeStr) || obj.question !== undefined;
-
-  let kind: CitationKind = 'ruleSection';
-  if (isErrata) kind = 'errataItem';
-  else if (isFaq) kind = 'faqItem';
+  const hasOverride =
+    sources.some((s) => s.override) || OVERRIDE_RE.test(body) || OVERRIDE_RE.test(title);
 
   return {
-    id: firstString(obj, ['id', '_id', 'slug', 'url', 'uri']) || title,
-    kind,
-    title: title || 'Untitled entry',
-    chapter: firstString(obj, ['chapter', 'section', 'category']) || undefined,
-    changeType: normalizeChangeType(obj, kind, title, content),
-    effectiveDate: firstString(obj, ['effectiveDate', 'effective_date', 'date']) || undefined,
-    sourceUrl: firstString(obj, ['sourceUrl', 'source_url', 'url', 'uri']) || undefined,
-    content: content.trim(),
+    id: slugify(title),
+    kind: hasOverride ? 'errataItem' : 'ruleSection',
+    title,
+    changeType: hasOverride ? 'override' : undefined,
+    content: body,
+    sources,
   };
-}
-
-/**
- * Turn whatever knowledge_base_read returned into a uniform entry list.
- * Handles structured JSON results and plain Markdown text results.
- */
-export function normalizeEntries(rawText: string, rawResult: unknown): RetrievedEntry[] {
-  const candidates = parseStructuredCandidates(rawText, rawResult);
-
-  if (candidates) {
-    const entries = candidates.map(toEntry).filter((e): e is RetrievedEntry => e !== null);
-    if (entries.length > 0) return entries;
-  }
-
-  if (rawText.trim()) {
-    return [
-      {
-        id: 'retrieved-context',
-        kind: 'ruleSection',
-        title: 'Retrieved context',
-        content: rawText.trim(),
-      },
-    ];
-  }
-
-  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -275,9 +333,7 @@ async function getInitialContext(): Promise<string> {
     const tools = await toolSet();
     const initialContext = tools[INITIAL_CONTEXT_TOOL];
     if (initialContext?.execute) {
-      cachedContext = extractResultText(
-        await initialContext.execute(buildQueryArgs(initialContext, ''))
-      );
+      cachedContext = extractResultText(await initialContext.execute({}));
     }
   } catch {
     cachedContext = ''; // non-fatal: proceed without the system context
@@ -303,8 +359,28 @@ async function retrieveEntries(question: string): Promise<{ entries: RetrievedEn
     );
   }
 
-  const result = await read.execute(buildQueryArgs(read, question));
-  return { entries: normalizeEntries(extractResultText(result), result), tools: names };
+  // 1) Read the KB outline: it carries the knowledge base id + every entry path.
+  const outlineText = await getInitialContext();
+  const { kbId, entries: outlineEntries } = parseOutline(outlineText);
+  if (!kbId || outlineEntries.length === 0) {
+    throw new Error(
+      'Could not read the Knowledge Base outline from the MCP endpoint. ' +
+        'Rebuild your Knowledge Base and reconnect the endpoint.'
+    );
+  }
+
+  // 2) Map the user's question onto entry paths.
+  const selection = selectPaths(question, outlineEntries);
+  if (selection.length === 0) {
+    return { entries: [], tools: names };
+  }
+  const paths = selection.map((e) => e.path);
+
+  // 3) Read the selected entries (path-based, in a single call).
+  const result = await read.execute({ knowledgeBase: kbId, paths });
+  const text = extractResultText(result);
+  const entries = parseKbEntryMarkdown(text);
+  return { entries, tools: names };
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +389,23 @@ async function retrieveEntries(question: string): Promise<{ entries: RetrievedEn
 
 function toCitation(entry: RetrievedEntry): Citation {
   return { ...entry, override: entry.changeType === 'override' };
+}
+
+/**
+ * The KB read returns entries whose body already lists their sources (the
+ * seeded rulebook/errata/FAQ docs). Expose those docs as the answer's
+ * citations so the UI lists them individually and can flag OVERRIDE items.
+ */
+function entryToCitations(entry: RetrievedEntry): Citation[] {
+  if (!entry.sources || entry.sources.length === 0) return [toCitation(entry)];
+  return entry.sources.map((s) => ({
+    id: s.title,
+    kind: s.kind,
+    title: s.title,
+    changeType: s.override ? 'override' : undefined,
+    content: entry.content,
+    override: s.override,
+  }));
 }
 
 function formatEntry(entry: RetrievedEntry, index: number): string {
@@ -369,8 +462,8 @@ function formatForLlm(question: string, initialContext: string, entries: Retriev
 }
 
 async function composeLlmAnswer(question: string, initialContext: string, entries: RetrievedEntry[]): Promise<string> {
-  const modelName = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-  const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const modelName = readEnv('OPENAI_MODEL') || 'gpt-4o-mini';
+  const openai = createOpenAI({ apiKey: readEnv('OPENAI_API_KEY') ?? '' });
   const { system, prompt } = formatForLlm(question, initialContext, entries);
   const result = await generateText({ model: openai(modelName), system, prompt, temperature: 0.2 });
   return result.text;
@@ -414,7 +507,7 @@ function composeMockAnswer(question: string, entries: RetrievedEntry[]): string 
 // ---------------------------------------------------------------------------
 
 export async function answerQuestion(question: string): Promise<AgentResult> {
-  const mockMode = process.env.RULEBOOK_MOCK === '1';
+  const mockMode = readEnv('RULEBOOK_MOCK') === '1';
 
   if (mockMode) {
     return {
@@ -426,7 +519,16 @@ export async function answerQuestion(question: string): Promise<AgentResult> {
   }
 
   const { entries, tools } = await retrieveEntries(question);
-  const citations = entries.map(toCitation);
+  const seenTitles = new Set<string>();
+  const citations = entries
+    .flatMap(entryToCitations)
+    .filter((c) => {
+      const key = `${c.kind}:${c.title}`;
+      if (seenTitles.has(key)) return false;
+      seenTitles.add(key);
+      return true;
+    })
+    .slice(0, 10);
   const hasOverride = entries.some((e) => e.changeType === 'override');
 
   if (entries.length === 0) {
@@ -439,11 +541,11 @@ export async function answerQuestion(question: string): Promise<AgentResult> {
     };
   }
 
-  const llmEnabled = Boolean(process.env.OPENAI_API_KEY);
+  const llmEnabled = Boolean(readEnv('OPENAI_API_KEY'));
   if (llmEnabled) {
     const initialContext = await getInitialContext();
     const answer = await composeLlmAnswer(question, initialContext, entries);
-    return { answer, citations, hasOverride, mode: 'llm', tools, modelUsed: process.env.OPENAI_MODEL || 'gpt-4o-mini' };
+    return { answer, citations, hasOverride, mode: 'llm', tools, modelUsed: readEnv('OPENAI_MODEL') || 'gpt-4o-mini' };
   }
 
   return {
@@ -463,9 +565,9 @@ export function getStatus(): {
   mock: boolean;
 } {
   return {
-    urlConfigured: Boolean(process.env.SANITY_CONTEXT_MCP_URL),
-    tokenConfigured: Boolean(process.env.SANITY_ORGANIZATION_TOKEN),
-    llmConfigured: Boolean(process.env.OPENAI_API_KEY),
-    mock: process.env.RULEBOOK_MOCK === '1',
+    urlConfigured: Boolean(readEnv('SANITY_CONTEXT_MCP_URL')),
+    tokenConfigured: Boolean(readEnv('SANITY_ORGANIZATION_TOKEN')),
+    llmConfigured: Boolean(readEnv('OPENAI_API_KEY')),
+    mock: readEnv('RULEBOOK_MOCK') === '1',
   };
 }
