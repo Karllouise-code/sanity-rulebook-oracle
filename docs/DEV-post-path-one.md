@@ -46,11 +46,12 @@ The core rulebook says yes… but the 2025-03-01 errata **overrides** it: two-we
 
 Path: **Path One — Ship an Agent That Queries Real Content**
 
-Sanity project id: `REPLACE_WITH_PROJECT_ID` | Dataset: `production` (default)
-Knowledge base: **Rulebook Oracle KB** (`kb_REPLACE`) · MCP endpoint: **rulebook-oracle**
+Sanity project id: `g2fvri91` | Dataset: `production` (default)
+Knowledge base: **Rulebook Oracle KB** (`kblX52Exu3S8`) · MCP endpoint: **rulebook-oracle**
+Repo: https://github.com/Karllouise-code/sanity-rulebook-oracle
 
 Demo video: `REPLACE_WITH_LINK` (screen recording + [transcript REPLACE])
-Sanity dashboard: `REPLACE_WITH_MANAGE_LINK`
+Sanity dashboard: https://www.sanity.io/manage/project/g2fvri91
 
 *Transcript: swap this paragraph for a full .vtt/verbatim transcript of the demo. I narrate over a recorded run: open the app → ask the two-weapon diagram question → point at the Override badge and the two citations → show the KB build in Sanity Context → show the endpoint id + URL.*
 
