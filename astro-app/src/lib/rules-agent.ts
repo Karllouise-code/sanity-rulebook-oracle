@@ -561,9 +561,25 @@ export async function answerQuestion(question: string): Promise<AgentResult> {
 
   const llmConfig = getLlmConfig();
   if (llmConfig) {
-    const initialContext = await getInitialContext();
-    const answer = await composeLlmAnswer(question, initialContext, entries);
-    return { answer, citations, hasOverride, mode: 'llm', tools, modelUsed: llmConfig.modelName };
+    try {
+      const initialContext = await getInitialContext();
+      const answer = await composeLlmAnswer(question, initialContext, entries);
+      return { answer, citations, hasOverride, mode: 'llm', tools, modelUsed: llmConfig.modelName };
+    } catch (error) {
+      // The summarizer (e.g. a rate-limited Gemini quota) is optional: if it
+      // fails, answer deterministically from the retrieved entries instead of
+      // erroring out at the table.
+      return {
+        answer:
+          composeRetrievalAnswer(question, entries) +
+          '\n\n(LLM summarizer unavailable — showing the retrieved entries verbatim.)',
+        citations,
+        hasOverride,
+        mode: 'retrieval',
+        tools,
+        modelUsed: llmConfig.modelName,
+      };
+    }
   }
 
   return {
