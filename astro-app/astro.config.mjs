@@ -1,13 +1,12 @@
 import { defineConfig } from 'astro/config';
-import node from '@astrojs/node';
+import netlify from '@astrojs/netlify';
 
-// SSR on a Node adapter so the /api/chat route can run the agent loop
-// server-side (Sanity tokens never leave the server).
+// SSR on Netlify's Node runtime so the /api/chat route can run the agent
+// loop server-side (Sanity tokens never leave the server).
 //
-// Deploying to Vercel or Netlify? Swap the adapter:
-//   @astrojs/vercel => import vercel from '@astrojs/vercel'; adapter: vercel()
-//   @astrojs/netlify => import netlify from '@astrojs/netlify'; adapter: netlify()
+// For the standalone Node LTS server used in the README instead:
+//   @astrojs/node => import node from '@astrojs/node'; adapter: node({ mode: 'standalone' })
 export default defineConfig({
   output: 'server',
-  adapter: node({ mode: 'standalone' }),
+  adapter: netlify(),
 });

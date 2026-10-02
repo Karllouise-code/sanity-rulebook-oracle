@@ -3,6 +3,11 @@
  * Rulebook Oracle — single-page chat UI.
  * Talks to the server-side agent loop at /api/chat.
  */
+// Static UI shell — the chat talks to /api/chat from the browser, so this
+// page can be prerendered. Keeps Netlify's publish directory non-empty while
+// /api/chat stays an SSR route.
+export const prerender = true;
+
 const exampleQuestions = [
   'Can I attack twice if I wield two short swords?',
   'What happens when my Health hits 0?',

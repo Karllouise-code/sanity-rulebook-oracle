@@ -17,6 +17,7 @@
     "@ai-sdk/google": "^2.0.99",
     "@ai-sdk/mcp": "^1.0.82",
     "@ai-sdk/openai": "^2.0.127",
+    "@astrojs/netlify": "^6.6.5",
     "@astrojs/node": "^9.5.5",
     "ai": "^5.0.261",
     "astro": "^5.18.2"
