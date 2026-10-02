@@ -3,6 +3,8 @@
  * Rulebook Oracle — single-page chat UI.
  * Talks to the server-side agent loop at /api/chat.
  */
+import '../styles/global.css';
+
 // Static UI shell — the chat talks to /api/chat from the browser, so this
 // page can be prerendered. Keeps Netlify's publish directory non-empty while
 // /api/chat stays an SSR route.
@@ -26,7 +28,6 @@ const exampleQuestions = [
       name="description"
       content="Ask the Steeldusk rules agent anything. Answers cite the core rulebook, errata, and FAQs, and flag overrides."
     />
-    <link rel="stylesheet" href="/src/styles/global.css" />
   </head>
   <body>
     <main class="shell">
