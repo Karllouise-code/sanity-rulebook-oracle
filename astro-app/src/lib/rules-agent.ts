@@ -22,9 +22,11 @@ function readEnv(key: string): string | undefined {
  * Flow (matches the Sanity Challenge Path One requirements):
  *   1. Connect to the Sanity Context MCP endpoint (Knowledge Base mode)
  *      using HTTP transport + Bearer Authorization header.
- *   2. Confirm `initial_context` and `knowledge_base_read` are exposed.
- *   3. On each question, call `knowledge_base_read` with a query derived
- *      from the user's message.
+ *   2. Confirm `initial_context` / `knowledge_base_search` / `knowledge_base_read`
+ *      are exposed.
+ *   3. On each question, pick entry paths via `knowledge_base_search` (falling
+ *      back to an outline keyword scorer) and read them with
+ *      `knowledge_base_read`.
  *   4. Compose an answer that uses ONLY the retrieved entries, cites each
  *      entry, and flags errata entries whose changeType is 'override'.
  *
@@ -69,6 +71,7 @@ export interface AgentResult {
 }
 
 const KB_READ_TOOL = 'knowledge_base_read';
+const KB_SEARCH_TOOL = 'knowledge_base_search';
 const INITIAL_CONTEXT_TOOL = 'initial_context';
 const OVERRIDE_RE = /\boverride\b/i;
 
@@ -123,6 +126,7 @@ export async function describeTools(): Promise<{
   tools: string[];
   initialContext: boolean;
   knowledgeBaseRead: boolean;
+  knowledgeBaseSearch: boolean;
 }> {
   const client = await getClient();
   const listed = await client.listTools();
@@ -131,6 +135,7 @@ export async function describeTools(): Promise<{
     tools: names,
     initialContext: names.includes(INITIAL_CONTEXT_TOOL),
     knowledgeBaseRead: names.includes(KB_READ_TOOL),
+    knowledgeBaseSearch: names.includes(KB_SEARCH_TOOL),
   };
 }
 
@@ -138,14 +143,17 @@ export async function describeTools(): Promise<{
 // Knowledge Base outline + path selection
 // ---------------------------------------------------------------------------
 //
-// The Context MCP endpoint in Knowledge Base mode exposes two tools:
-//   - `initial_context`      -> a markdown outline with the knowledge base id
-//                               and every entry's `path`.
-//   - `knowledge_base_read`  -> `{ knowledgeBase, paths: string[] }` returning
-//                               the full markdown content of those entries.
-// There is no free-text search: to answer, we map the user's question onto
-// outline paths with a lightweight keyword scorer. When an LLM key
-// the LLM then composes the final answer from exactly the entries read.
+// The Context MCP endpoint in Knowledge Base mode exposes up to three tools:
+//   - `initial_context`          -> a markdown outline with the knowledge base id
+//                                   and every entry's `path`.
+//   - `knowledge_base_search`    -> keyword search over entry content, returning
+//                                   ranked paths with relevance scores (preferred).
+//   - `knowledge_base_read`      -> `{ knowledgeBase, paths: string[] }` returning
+//                                   the full markdown content of those entries.
+// When search is available we use it to pick paths (its ranking understands
+// phrasing our outline scorer would miss, e.g. "Is a natural 6 always a hit?");
+// otherwise we fall back to the keyword scorer over the outline below. The LLM
+// (if configured) then composes the final answer from exactly the entries read.
 
 const KB_ID_RE = /^Knowledge base id:\s*`?([A-Za-z0-9_-]+)`?/m;
 const MAX_PATHS_READ = 4;
@@ -260,6 +268,39 @@ function extractResultText(result: unknown): string {
   return JSON.stringify(result);
 }
 
+/**
+ * Priority order for turning a question into KB paths to read:
+ *   1. knowledge_base_search (ranked, content-aware) — when the tool exists.
+ *   2. The outline keyword scorer as a fallback.
+ */
+function parseSearchPaths(text: string): string[] {
+  const paths: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\d+\.\s+`([^`]+)`\s+\(score\s+[\d.]+\)/);
+    if (match) paths.push(match[1].trim());
+  }
+  return paths;
+}
+
+async function resolvePaths(
+  question: string,
+  kbId: string,
+  tools: Record<string, CallableTool>,
+  outlineEntries: OutlineEntry[]
+): Promise<string[]> {
+  const search = tools[KB_SEARCH_TOOL];
+  if (search?.execute) {
+    try {
+      const result = await search.execute({ knowledgeBase: kbId, query: question });
+      const found = parseSearchPaths(extractResultText(result));
+      if (found.length > 0) return found.slice(0, MAX_PATHS_READ);
+    } catch {
+      // non-fatal: fall back to the outline scorer below
+    }
+  }
+  return selectPaths(question, outlineEntries).map((e) => e.path).slice(0, MAX_PATHS_READ);
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge base entry parsing (markdown returned by knowledge_base_read)
 // ---------------------------------------------------------------------------
@@ -371,12 +412,11 @@ async function retrieveEntries(question: string): Promise<{ entries: RetrievedEn
     );
   }
 
-  // 2) Map the user's question onto entry paths.
-  const selection = selectPaths(question, outlineEntries);
-  if (selection.length === 0) {
+  // 2) Map the user's question onto entry paths (search first, outline fallback).
+  const paths = await resolvePaths(question, kbId, tools, outlineEntries);
+  if (paths.length === 0) {
     return { entries: [], tools: names };
   }
-  const paths = selection.map((e) => e.path);
 
   // 3) Read the selected entries (path-based, in a single call).
   const result = await read.execute({ knowledgeBase: kbId, paths });
